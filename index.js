@@ -193,7 +193,7 @@ async function start() {
     queueAuthSync();
   });
 
-  sock.ev.on("connection.update", ({ connection, qr, lastDisconnect }) => {
+  sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
     if (qr) {
       lastQr = qr;
       console.log("\n=== QR novo — abra /qr no navegador pra escanear ===\n");
@@ -204,8 +204,16 @@ async function start() {
       connected = false;
       const code = lastDisconnect?.error?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
-        console.error("Deslogado. Apague a pasta ./auth e rode de novo.");
-        process.exit(1);
+        console.error("Deslogado — limpando sessão (local + bucket) pra pedir QR novo...");
+        try {
+          if (supa) {
+            const { data: files } = await supa.storage.from(AUTH_BUCKET).list("", { limit: 1000 });
+            if (files?.length)
+              await supa.storage.from(AUTH_BUCKET).remove(files.map((f) => f.name));
+          }
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        } catch { }
+        process.exit(1); // Render reinicia → bucket vazio → QR novo
       }
       console.log("Conexão caiu (código " + code + ") — reconectando...");
       setTimeout(start, 3000);
