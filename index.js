@@ -63,11 +63,14 @@ async function pushAuth() {
   if (!fs.existsSync(AUTH_DIR)) return;
   for (const name of fs.readdirSync(AUTH_DIR)) {
     const p = path.join(AUTH_DIR, name);
-    if (!fs.statSync(p).isFile()) continue;
-    const { error } = await supa.storage
-      .from(AUTH_BUCKET)
-      .upload(name, fs.readFileSync(p), { upsert: true, contentType: "application/octet-stream" });
-    if (error) console.error("upload auth " + name + ":", error.message);
+    try {
+      // Baileys remove pre-keys usadas — arquivo pode sumir entre readdir e stat
+      if (!fs.statSync(p).isFile()) continue;
+      const { error } = await supa.storage
+        .from(AUTH_BUCKET)
+        .upload(name, fs.readFileSync(p), { upsert: true, contentType: "application/octet-stream" });
+      if (error) console.error("upload auth " + name + ":", error.message);
+    } catch { /* arquivo sumiu — normal */ }
   }
 }
 
