@@ -94,7 +94,28 @@ let connected = false;
 let lastQr = null;
 http
   .createServer(async (req, res) => {
-    if (req.url === "/qr" && lastQr && !connected) {
+    const url = new URL(req.url, "http://x");
+    // zera sessão (local + bucket) quando as chaves ficam corrompidas —
+    // o processo morre, o Render reinicia e o /qr pede pareamento novo
+    if (url.pathname === "/reset-auth") {
+      if (url.searchParams.get("key") !== SECRET)
+        return res.writeHead(401).end("unauthorized");
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("sessão zerada — o serviço vai reiniciar e pedir QR novo em /qr");
+      setTimeout(async () => {
+        try {
+          if (supa) {
+            const { data: files } = await supa.storage.from(AUTH_BUCKET).list("", { limit: 1000 });
+            if (files?.length)
+              await supa.storage.from(AUTH_BUCKET).remove(files.map((f) => f.name));
+          }
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        } catch { }
+        process.exit(0); // Render reinicia sozinho
+      }, 500);
+      return;
+    }
+    if (url.pathname === "/qr" && lastQr && !connected) {
       const QRCode = require("qrcode");
       const png = await QRCode.toBuffer(lastQr, { width: 320, margin: 2 });
       res.writeHead(200, { "Content-Type": "image/png" });
