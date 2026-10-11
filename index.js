@@ -23,12 +23,62 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
 } = require("@whiskeysockets/baileys");
+const { createClient } = require("@supabase/supabase-js");
 
 let cfg = {};
 try { cfg = require("./config.json"); } catch { }
 const SITE = (process.env.SITE_URL || cfg.site_url || "https://faztframmer.vercel.app").replace(/\/+$/, "");
 const SECRET = process.env.WA_WEBHOOK_SECRET || cfg.wa_webhook_secret || "";
 const POLL_MS = 2000;
+const AUTH_DIR = path.join(__dirname, "auth");
+
+// Sessão persistida no Supabase Storage — sobrevive a redeploy no Render
+// (filesystem efêmero). Sem essas envs cai no modo local-only (só pra dev).
+const supa =
+  (process.env.SUPABASE_URL || cfg.supabase_url) && (process.env.SUPABASE_SERVICE_ROLE_KEY || cfg.supabase_service_role_key)
+    ? createClient(process.env.SUPABASE_URL || cfg.supabase_url, process.env.SUPABASE_SERVICE_ROLE_KEY || cfg.supabase_service_role_key)
+    : null;
+const AUTH_BUCKET = "wa-auth";
+
+async function ensureAuthBucket() {
+  const { error } = await supa.storage.getBucket(AUTH_BUCKET);
+  if (error) {
+    const { error: e2 } = await supa.storage.createBucket(AUTH_BUCKET, { public: false });
+    if (e2) console.error("criar bucket auth:", e2.message);
+  }
+}
+
+async function pullAuth() {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+  const { data: files, error } = await supa.storage.from(AUTH_BUCKET).list("", { limit: 1000 });
+  if (error) return console.error("listar auth:", error.message);
+  for (const f of files || []) {
+    const { data } = await supa.storage.from(AUTH_BUCKET).download(f.name);
+    if (data) fs.writeFileSync(path.join(AUTH_DIR, f.name), Buffer.from(await data.arrayBuffer()));
+  }
+  if (files?.length) console.log("sessão restaurada do Supabase (" + files.length + " arquivos)");
+}
+
+async function pushAuth() {
+  if (!fs.existsSync(AUTH_DIR)) return;
+  for (const name of fs.readdirSync(AUTH_DIR)) {
+    const p = path.join(AUTH_DIR, name);
+    if (!fs.statSync(p).isFile()) continue;
+    const { error } = await supa.storage
+      .from(AUTH_BUCKET)
+      .upload(name, fs.readFileSync(p), { upsert: true, contentType: "application/octet-stream" });
+    if (error) console.error("upload auth " + name + ":", error.message);
+  }
+}
+
+let syncTimer = null;
+function queueAuthSync() {
+  if (!supa || syncTimer) return;
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    pushAuth().catch((e) => console.error("sync auth:", e?.message || e));
+  }, 3000);
+}
 
 if (!SECRET) {
   console.error("Defina WA_WEBHOOK_SECRET (env ou config.json) — o mesmo do site.");
@@ -91,7 +141,15 @@ async function drainOutbox(sock) {
 }
 
 async function start() {
-  const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, "auth"));
+  if (supa) {
+    try {
+      await ensureAuthBucket();
+      await pullAuth();
+    } catch (e) {
+      console.error("restaurar sessão:", e?.message || e);
+    }
+  }
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
   const sock = makeWASocket({
     version,
@@ -109,7 +167,10 @@ async function start() {
     keepAliveIntervalMs: 30_000,
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+    queueAuthSync();
+  });
 
   sock.ev.on("connection.update", ({ connection, qr, lastDisconnect }) => {
     if (qr) {
@@ -117,7 +178,7 @@ async function start() {
       console.log("\n=== QR novo — abra /qr no navegador pra escanear ===\n");
       qrcode.generate(qr, { small: true });
     }
-    if (connection === "open") { connected = true; lastQr = null; console.log("✓ WhatsApp conectado — atendimento ativo"); }
+    if (connection === "open") { connected = true; lastQr = null; console.log("✓ WhatsApp conectado — atendimento ativo"); queueAuthSync(); }
     if (connection === "close") {
       connected = false;
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -139,6 +200,9 @@ async function start() {
   });
 
   setInterval(() => drainOutbox(sock).catch(() => { }), POLL_MS);
+  // chaves de sessão mudam durante conversas — sync periódico garante que
+  // um redeploy não volte com chaves velhas e falhe a descriptografia
+  if (supa) setInterval(queueAuthSync, 60_000);
 }
 
 start().catch((e) => {
