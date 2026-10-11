@@ -227,6 +227,14 @@ async function start() {
   });
 
   const startedAt = Math.floor(Date.now() / 1000);
+  const ppCache = new Map();
+  const ppFor = async (jid) => {
+    if (ppCache.has(jid)) return ppCache.get(jid);
+    let url = null;
+    try { url = await sock.profilePictureUrl(jid, "image"); } catch { }
+    ppCache.set(jid, url);
+    return url;
+  };
 
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     console.log("messages.upsert type=" + type + " count=" + (messages?.length || 0));
@@ -238,7 +246,9 @@ async function start() {
         "tipo:", Object.keys(m.message || {}).join("+") || "sem-message",
         "→ webhook"
       );
-      postWebhook(m).catch((e) => console.error("webhook:", e?.message || e));
+      (m.key.fromMe ? Promise.resolve(null) : ppFor(m.key.remoteJidAlt ?? m.key.remoteJid))
+        .then((ppUrl) => postWebhook({ ...m, ppUrl }))
+        .catch((e) => console.error("webhook:", e?.message || e));
     }
   });
 
