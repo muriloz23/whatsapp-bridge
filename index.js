@@ -85,7 +85,7 @@ if (!SECRET) {
   process.exit(1);
 }
 
-const log = pino({ level: "warn" });
+const log = pino({ level: process.env.WA_LOG_LEVEL || "warn" });
 
 // Render/web service exige porta aberta — health check pra monitor (UptimeRobot
 // pingando a cada 5min mantém o tier free acordado)
@@ -160,7 +160,7 @@ async function start() {
     fireInitQueries: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    shouldSyncHistoryMessage: () => false,
+    shouldSyncHistoryMessage: () => true,
     generateHighQualityLinkPreview: false,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
@@ -191,10 +191,26 @@ async function start() {
     }
   });
 
-  sock.ev.on("messages.upsert", ({ messages }) => {
-    for (const m of messages) {
+  const startedAt = Math.floor(Date.now() / 1000);
+
+  sock.ev.on("messages.upsert", ({ messages, type }) => {
+    console.log("messages.upsert type=" + type + " count=" + (messages?.length || 0));
+    for (const m of messages || []) {
       if (!m?.key?.remoteJid) continue;
       console.log("msg recebida de", m.key.remoteJid, m.key.fromMe ? "(minha)" : "", "→ webhook");
+      postWebhook(m).catch((e) => console.error("webhook:", e?.message || e));
+    }
+  });
+
+  // msgs que chegaram enquanto o socket estava caindo/reconectando vêm por
+  // history.set em vez de upsert — repassa as recentes (o webhook deduplica por waId)
+  sock.ev.on("messaging-history.set", ({ messages }) => {
+    const fresh = (messages || []).filter(
+      (m) => m?.key?.remoteJid && !m.key.fromMe && (m.messageTimestamp ?? 0) >= startedAt
+    );
+    console.log("history.set count=" + (messages?.length || 0) + " novas=" + fresh.length);
+    for (const m of fresh) {
+      console.log("msg recebida (sync) de", m.key.remoteJid, "→ webhook");
       postWebhook(m).catch((e) => console.error("webhook:", e?.message || e));
     }
   });
