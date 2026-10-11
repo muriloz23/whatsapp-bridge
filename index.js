@@ -93,7 +93,21 @@ async function drainOutbox(sock) {
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, "auth"));
   const { version } = await fetchLatestBaileysVersion();
-  const sock = makeWASocket({ version, auth: state, logger: log });
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: log,
+    // evita o stall de "init queries" que conecta mas não entrega msgs —
+    // o atendimento só precisa de msgs novas, não do histórico
+    fireInitQueries: false,
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    shouldSyncHistoryMessage: () => false,
+    generateHighQualityLinkPreview: false,
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    keepAliveIntervalMs: 30_000,
+  });
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -119,6 +133,7 @@ async function start() {
   sock.ev.on("messages.upsert", ({ messages }) => {
     for (const m of messages) {
       if (!m?.key?.remoteJid) continue;
+      console.log("msg recebida de", m.key.remoteJid, m.key.fromMe ? "(minha)" : "", "→ webhook");
       postWebhook(m).catch((e) => console.error("webhook:", e?.message || e));
     }
   });
