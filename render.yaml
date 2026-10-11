@@ -1,0 +1,15 @@
+# Blueprint Render — Web Service free da bridge WhatsApp
+# Em render.com: New → Blueprint → aponta pro repo/pasta contendo este arquivo.
+services:
+  - type: web
+    name: faztframmer-wa-bridge
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: SITE_URL
+        value: https://faztframmer.vercel.app
+      - key: WA_WEBHOOK_SECRET
+        sync: false   # preencher no dashboard com o mesmo valor do site
+    healthCheckPath: /
