@@ -8,6 +8,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.47.0",
     "@whiskeysockets/baileys": "^6.7.9",
     "pino": "^9.0.0",
     "qrcode": "^1.5.4",
