@@ -141,7 +141,10 @@ async function postWebhook(data) {
 async function drainOutbox(sock) {
   try {
     const r = await fetch(`${SITE}/api/whatsapp/outbox?key=${SECRET}`, { cache: "no-store" });
-    if (!r.ok) return;
+    if (!r.ok) {
+      if (!drainOutbox.warned) { console.error("outbox", r.status, "— confira WA_WEBHOOK_SECRET no Vercel"); drainOutbox.warned = true; }
+      return;
+    }
     const rows = await r.json();
     for (const row of rows) {
       try {
@@ -229,7 +232,12 @@ async function start() {
     console.log("messages.upsert type=" + type + " count=" + (messages?.length || 0));
     for (const m of messages || []) {
       if (!m?.key?.remoteJid) continue;
-      console.log("msg recebida de", m.key.remoteJid, m.key.fromMe ? "(minha)" : "", "→ webhook");
+      console.log(
+        "msg recebida de", m.key.remoteJid,
+        m.key.fromMe ? "(minha)" : "",
+        "tipo:", Object.keys(m.message || {}).join("+") || "sem-message",
+        "→ webhook"
+      );
       postWebhook(m).catch((e) => console.error("webhook:", e?.message || e));
     }
   });
