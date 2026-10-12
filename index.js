@@ -48,30 +48,53 @@ async function ensureAuthBucket() {
   }
 }
 
+// Snapshot único: todo o auth dir serializado num objeto só. Antes era 1
+// upload por arquivo (centenas de pre-keys/sessions) — estourava o limite de
+// conexões do Storage e deixava o bucket com estado pela metade → PreKeyError.
+const AUTH_BUNDLE = "auth-state.json";
+
 async function pullAuth() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
+  const { data: bundle } = await supa.storage.from(AUTH_BUCKET).download(AUTH_BUNDLE);
+  if (bundle) {
+    const map = JSON.parse(Buffer.from(await bundle.arrayBuffer()).toString());
+    for (const [name, b64] of Object.entries(map))
+      fs.writeFileSync(path.join(AUTH_DIR, name), Buffer.from(b64, "base64"));
+    console.log("sessão restaurada do Supabase (" + Object.keys(map).length + " arquivos)");
+    return;
+  }
+  // primeira migração: bucket ainda no formato antigo (1 objeto por arquivo)
   const { data: files, error } = await supa.storage.from(AUTH_BUCKET).list("", { limit: 1000 });
   if (error) return console.error("listar auth:", error.message);
   for (const f of files || []) {
     const { data } = await supa.storage.from(AUTH_BUCKET).download(f.name);
     if (data) fs.writeFileSync(path.join(AUTH_DIR, f.name), Buffer.from(await data.arrayBuffer()));
   }
-  if (files?.length) console.log("sessão restaurada do Supabase (" + files.length + " arquivos)");
+  if (files?.length) console.log("sessão restaurada do Supabase (legado, " + files.length + " arquivos)");
 }
 
 async function pushAuth() {
   if (!fs.existsSync(AUTH_DIR)) return;
+  const map = {};
   for (const name of fs.readdirSync(AUTH_DIR)) {
-    const p = path.join(AUTH_DIR, name);
     try {
+      const p = path.join(AUTH_DIR, name);
       // Baileys remove pre-keys usadas — arquivo pode sumir entre readdir e stat
       if (!fs.statSync(p).isFile()) continue;
-      const { error } = await supa.storage
-        .from(AUTH_BUCKET)
-        .upload(name, fs.readFileSync(p), { upsert: true, contentType: "application/octet-stream" });
-      if (error) console.error("upload auth " + name + ":", error.message);
+      map[name] = fs.readFileSync(p).toString("base64");
     } catch { /* arquivo sumiu — normal */ }
   }
+  const { error } = await supa.storage
+    .from(AUTH_BUCKET)
+    .upload(AUTH_BUNDLE, Buffer.from(JSON.stringify(map)), { upsert: true, contentType: "application/json" });
+  if (error) return console.error("upload auth:", error.message);
+  // remove os objetos do formato antigo — se ficarem, um pull legado numa
+  // falha de download do bundle restauraria pre-keys velhas → Invalid PreKey ID
+  try {
+    const { data: files } = await supa.storage.from(AUTH_BUCKET).list("", { limit: 1000 });
+    const legacy = (files || []).filter((f) => f.name !== AUTH_BUNDLE).map((f) => f.name);
+    if (legacy.length) await supa.storage.from(AUTH_BUCKET).remove(legacy);
+  } catch { }
 }
 
 let syncTimer = null;
@@ -191,9 +214,15 @@ async function resetContactSession(sock, jid) {
   console.log("sessão resetada p/ " + jid);
 }
 
+// IDs das mensagens que a PRÓPRIA bridge enviou — o eco delas volta como
+// fromMe no messages.upsert e não pode ser confundido com o operador
+// digitando no celular do negócio (que pausa a IA na conversa).
+const sentByUs = new Set();
+
 // envio "humano": subscribe (negocia a sessão E2E antes) → digitando → delay
 // proporcional ao tamanho → envia → pausa. Reduz "Aguardando mensagem" e ban.
 async function sendHuman(sock, jid, payload) {
+  if (!connected) throw new Error("whatsapp offline — outbox retenta no próximo tick");
   const target = await resolveSendJid(sock, jid);
   // força criar a sessão Signal com o contato ANTES da msg — é isso que mata
   // o "Aguardando mensagem" no celular de quem recebe
@@ -201,23 +230,36 @@ async function sendHuman(sock, jid, payload) {
   try { await sock.presenceSubscribe(target); } catch { }
   try { await sock.sendPresenceUpdate("composing", target); } catch { }
   const len = payload.text?.length ?? payload.caption?.length ?? 180;
-  await sleep(Math.min(3500, 600 + len * 20));
+  await sleep(Math.min(1800, 300 + len * 10)); // digitação convincente sem fazer o cliente esperar
   try {
-    await sock.sendMessage(target, payload);
+    const sent = await sock.sendMessage(target, payload);
+    if (sent?.key?.id) sentByUs.add(sent.key.id);
   } catch (e) {
+    // socket morto: retentar agora é no-op — a linha do outbox fica pendente
+    // e o próximo poll (após reconectar) entrega
+    if (!connected)
+      throw new Error("conexão caiu durante o envio — outbox retenta no próximo tick");
     // sessão Signal corrompida (Bad MAC / "no sessions" / "reading 'id'") —
     // apaga a sessão quebrada, renegocia via prekey bundle e tenta 1x de novo
     console.error("send falhou (" + (e?.message || e) + ") — resetando sessão e retentando");
     await resetContactSession(sock, target);
     try { await sock.assertSessions?.([target], true); } catch { }
     await sleep(400);
-    await sock.sendMessage(target, payload);
+    if (!connected)
+      throw new Error("conexão caiu durante o envio — outbox retenta no próximo tick");
+    try {
+      const sent = await sock.sendMessage(target, payload);
+      if (sent?.key?.id) sentByUs.add(sent.key.id);
+    } catch (e2) {
+      throw new Error("send falhou 2x: " + (e2?.message || e2));
+    }
   }
   try { await sock.sendPresenceUpdate("paused", target); } catch { }
   return target;
 }
 
 async function drainOutbox(sock) {
+  if (!connected) return; // socket fora — não gasta request nem marca nada
   try {
     const r = await fetch(`${SITE}/api/whatsapp/outbox?key=${SECRET}`, { cache: "no-store" });
     if (!r.ok) {
@@ -309,6 +351,10 @@ async function start() {
   });
 
   const startedAt = Math.floor(Date.now() / 1000);
+  // msgs que chegam sem payload = descriptografia falhou (PreKeyError/Bad MAC).
+  // 2+ seguidas do mesmo contato → sessão dele está quebrada: apaga pra
+  // renegociar do zero na próxima, em vez de perder mensagem pra sempre.
+  const decryptFails = new Map();
   const ppCache = new Map();
   const ppFor = async (jid) => {
     if (ppCache.has(jid)) return ppCache.get(jid);
@@ -328,14 +374,30 @@ async function start() {
         const pn = (m.key.remoteJidAlt ?? m.key.senderPn ?? "").split("@")[0].split(":")[0];
         if (lid && pn && /^\d{10,15}$/.test(pn)) lidFor.set(pn, lid);
       }
+      // fromMe pode ser: eco do próprio envio do bot (ignora) ou o OPERADOR
+      // digitando no celular do negócio (marca p/ o webhook pausar a IA).
+      // O timestamp >= startedAt evita ecos antigos de sessões anteriores.
+      const isOperator =
+        !!m.key.fromMe &&
+        !sentByUs.has(m.key.id) &&
+        (m.messageTimestamp ?? 0) >= startedAt;
+      if (m.key.fromMe && !isOperator) continue;
+      if (!m.message && !m.key.fromMe) {
+        const n = (decryptFails.get(m.key.remoteJid) || 0) + 1;
+        decryptFails.set(m.key.remoteJid, n);
+        if (n === 2) {
+          console.log("2+ msgs não decriptadas de " + m.key.remoteJid + " — resetando sessão Signal");
+          resetContactSession(sock, m.key.remoteJid).catch(() => { });
+        }
+      } else if (m.message) decryptFails.delete(m.key.remoteJid);
       console.log(
         "msg recebida de", m.key.remoteJid,
-        m.key.fromMe ? "(minha)" : "",
+        isOperator ? "(OPERADOR)" : "",
         "tipo:", Object.keys(m.message || {}).join("+") || "sem-message",
         "→ webhook"
       );
       (m.key.fromMe ? Promise.resolve(null) : ppFor(m.key.remoteJidAlt ?? m.key.remoteJid))
-        .then((ppUrl) => postWebhook({ ...m, ppUrl }))
+        .then((ppUrl) => postWebhook({ ...m, ppUrl, operator: isOperator }))
         .catch((e) => console.error("webhook:", e?.message || e));
     }
   });
