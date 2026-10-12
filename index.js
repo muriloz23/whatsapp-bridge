@@ -138,6 +138,34 @@ async function postWebhook(data) {
   if (!r.ok) console.error("webhook", r.status);
 }
 
+// resolve @lid → número real quando a sessão conhece o mapeamento
+// (mensagem pra PN cai na mesma conversa e evita "Aguardando mensagem")
+async function resolveSendJid(sock, jid) {
+  if (!jid.endsWith("@lid")) return jid;
+  try {
+    const lid = jid.split("@")[0];
+    const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
+    const resolved = typeof pn === "string" ? pn.split("@")[0] : pn?.toString?.().split("@")[0];
+    if (resolved && /^\d{10,15}$/.test(resolved)) return `${resolved}@s.whatsapp.net`;
+  } catch { }
+  return jid;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// envio "humano": subscribe (negocia a sessão E2E antes) → digitando → delay
+// proporcional ao tamanho → envia → pausa. Reduz "Aguardando mensagem" e ban.
+async function sendHuman(sock, jid, payload) {
+  const target = await resolveSendJid(sock, jid);
+  try { await sock.presenceSubscribe(target); } catch { }
+  try { await sock.sendPresenceUpdate("composing", target); } catch { }
+  const len = payload.text?.length ?? payload.caption?.length ?? 180;
+  await sleep(Math.min(6500, 1300 + len * 42));
+  await sock.sendMessage(target, payload);
+  try { await sock.sendPresenceUpdate("paused", target); } catch { }
+  return target;
+}
+
 async function drainOutbox(sock) {
   try {
     const r = await fetch(`${SITE}/api/whatsapp/outbox?key=${SECRET}`, { cache: "no-store" });
@@ -148,13 +176,15 @@ async function drainOutbox(sock) {
     const rows = await r.json();
     for (const row of rows) {
       try {
+        let target;
         if (row.kind === "image" && row.media_b64)
-          await sock.sendMessage(row.jid, {
+          target = await sendHuman(sock, row.jid, {
             image: Buffer.from(row.media_b64, "base64"),
             caption: row.caption || undefined,
           });
         else if (row.text)
-          await sock.sendMessage(row.jid, { text: row.text });
+          target = await sendHuman(sock, row.jid, { text: row.text });
+        else continue;
         await fetch(`${SITE}/api/whatsapp/outbox?key=${SECRET}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -163,6 +193,7 @@ async function drainOutbox(sock) {
       } catch (e) {
         console.error("falha ao enviar p/ " + row.jid + ":", e?.message || e);
       }
+      await sleep(700); // respiro entre mensagens — não metralha
     }
   } catch { /* site fora — tenta no próximo tick */ }
 }
