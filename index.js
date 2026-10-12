@@ -217,7 +217,7 @@ async function start() {
     // o atendimento só precisa de msgs novas, não do histórico
     fireInitQueries: false,
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true,
     shouldSyncHistoryMessage: () => true,
     generateHighQualityLinkPreview: false,
     connectTimeoutMs: 60_000,
