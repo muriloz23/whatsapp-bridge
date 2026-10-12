@@ -138,20 +138,58 @@ async function postWebhook(data) {
   if (!r.ok) console.error("webhook", r.status);
 }
 
-// resolve @lid → número real quando a sessão conhece o mapeamento
-// (mensagem pra PN cai na mesma conversa e evita "Aguardando mensagem")
+// PN → LID aprendido das mensagens recebidas (remoteJid @lid + senderPn).
+// A sessão Signal do contato vive no @lid — mandar pro PN sem o mapeamento
+// faz o Baileys criar sessão nova e falhar com "reading 'id'".
+const lidFor = new Map();
+
+// resolve o JID de envio: se a sessão do contato vive num @lid, manda pra lá;
+// @lid vira PN quando o mapeamento existe (a msg cai na conversa certa)
 async function resolveSendJid(sock, jid) {
-  if (!jid.endsWith("@lid")) return jid;
+  if (jid.endsWith("@lid")) {
+    try {
+      const lid = jid.split("@")[0].split(":")[0];
+      const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
+      const n = typeof pn === "string" ? pn.split("@")[0].split(":")[0] : pn?.toString?.().split("@")[0].split(":")[0];
+      if (n && /^\d{10,15}$/.test(n)) return `${n}@s.whatsapp.net`;
+    } catch { }
+    return jid;
+  }
+  const pnNum = jid.split("@")[0];
+  if (lidFor.has(pnNum)) return `${lidFor.get(pnNum)}@lid`;
   try {
-    const lid = jid.split("@")[0];
-    const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
-    const resolved = typeof pn === "string" ? pn.split("@")[0] : pn?.toString?.().split("@")[0];
-    if (resolved && /^\d{10,15}$/.test(resolved)) return `${resolved}@s.whatsapp.net`;
+    const lid = await sock.signalRepository?.lidMapping?.getLIDForPN?.(pnNum);
+    const n = typeof lid === "string" ? lid.split("@")[0].split(":")[0]
+      : lid?.lid ? String(lid.lid).split("@")[0].split(":")[0]
+      : lid?.toString?.().split("@")[0].split(":")[0];
+    if (n && /^\d{10,15}$/.test(n)) { lidFor.set(pnNum, n); return `${n}@lid`; }
   } catch { }
   return jid;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Apaga a sessão Signal corrompida do contato: store do Baileys (se a API
+// existir) + arquivos session-*.{json} do auth dir + bucket (pra não voltar
+// corrompida num redeploy). Próxima msg renegocia do zero via prekey.
+async function resetContactSession(sock, jid) {
+  const num = jid.split("@")[0].split(":")[0];
+  try { await sock.signalRepository?.deleteSession?.(jid); } catch { }
+  try {
+    for (const f of fs.readdirSync(AUTH_DIR)) {
+      if (f.startsWith("session-") && f.includes(num))
+        try { fs.rmSync(path.join(AUTH_DIR, f), { force: true }); } catch { }
+    }
+  } catch { }
+  if (supa) {
+    try {
+      const { data: files } = await supa.storage.from(AUTH_BUCKET).list("", { limit: 1000 });
+      const bad = (files || []).filter((f) => f.name.startsWith("session-") && f.name.includes(num)).map((f) => f.name);
+      if (bad.length) await supa.storage.from(AUTH_BUCKET).remove(bad);
+    } catch { }
+  }
+  console.log("sessão resetada p/ " + jid);
+}
 
 // envio "humano": subscribe (negocia a sessão E2E antes) → digitando → delay
 // proporcional ao tamanho → envia → pausa. Reduz "Aguardando mensagem" e ban.
@@ -164,7 +202,17 @@ async function sendHuman(sock, jid, payload) {
   try { await sock.sendPresenceUpdate("composing", target); } catch { }
   const len = payload.text?.length ?? payload.caption?.length ?? 180;
   await sleep(Math.min(3500, 600 + len * 20));
-  await sock.sendMessage(target, payload);
+  try {
+    await sock.sendMessage(target, payload);
+  } catch (e) {
+    // sessão Signal corrompida (Bad MAC / "no sessions" / "reading 'id'") —
+    // apaga a sessão quebrada, renegocia via prekey bundle e tenta 1x de novo
+    console.error("send falhou (" + (e?.message || e) + ") — resetando sessão e retentando");
+    await resetContactSession(sock, target);
+    try { await sock.assertSessions?.([target], true); } catch { }
+    await sleep(400);
+    await sock.sendMessage(target, payload);
+  }
   try { await sock.sendPresenceUpdate("paused", target); } catch { }
   return target;
 }
@@ -274,6 +322,12 @@ async function start() {
     console.log("messages.upsert type=" + type + " count=" + (messages?.length || 0));
     for (const m of messages || []) {
       if (!m?.key?.remoteJid) continue;
+      // aprende LID ↔ PN: a sessão cripto vive no @lid — guarda pra responder lá
+      if (m.key.remoteJid.endsWith("@lid")) {
+        const lid = m.key.remoteJid.split("@")[0].split(":")[0];
+        const pn = (m.key.remoteJidAlt ?? m.key.senderPn ?? "").split("@")[0].split(":")[0];
+        if (lid && pn && /^\d{10,15}$/.test(pn)) lidFor.set(pn, lid);
+      }
       console.log(
         "msg recebida de", m.key.remoteJid,
         m.key.fromMe ? "(minha)" : "",
