@@ -157,10 +157,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // proporcional ao tamanho → envia → pausa. Reduz "Aguardando mensagem" e ban.
 async function sendHuman(sock, jid, payload) {
   const target = await resolveSendJid(sock, jid);
+  // força criar a sessão Signal com o contato ANTES da msg — é isso que mata
+  // o "Aguardando mensagem" no celular de quem recebe
+  try { await sock.assertSessions?.([target], false); } catch { }
   try { await sock.presenceSubscribe(target); } catch { }
   try { await sock.sendPresenceUpdate("composing", target); } catch { }
   const len = payload.text?.length ?? payload.caption?.length ?? 180;
-  await sleep(Math.min(6500, 1300 + len * 42));
+  await sleep(Math.min(3500, 600 + len * 20));
   await sock.sendMessage(target, payload);
   try { await sock.sendPresenceUpdate("paused", target); } catch { }
   return target;
@@ -193,7 +196,7 @@ async function drainOutbox(sock) {
       } catch (e) {
         console.error("falha ao enviar p/ " + row.jid + ":", e?.message || e);
       }
-      await sleep(700); // respiro entre mensagens — não metralha
+      await sleep(400); // respiro entre mensagens — não metralha
     }
   } catch { /* site fora — tenta no próximo tick */ }
 }
